@@ -117,9 +117,40 @@ def _config_params() -> list:
     return params
 
 
-@pytest.fixture(params=_config_params())
-async def sandbox_env(request) -> AsyncIterator[SandboxEnvironment]:
+# Module-scoped: one env per config, shared by all checks (like the old
+# self_check() runner) — a per-check env meant a docker compose up/down per
+# check and tripled the slow-tools CI job. Checks must clean up after
+# themselves. anyio's default anyio_backend fixture is module-scoped, so this
+# works, and setup and teardown share the fixture's async context: the docker
+# provider stashes running projects in a ContextVar during init and reads it
+# back at cleanup — losing that context is the LookupError that sank
+# https://github.com/UKGovernmentBEIS/inspect_ai/pull/347 under pytest-asyncio.
+@pytest.fixture(scope="module", params=_config_params())
+async def _config_and_env(
+    request,
+) -> AsyncIterator[tuple[SandboxConfig, SandboxEnvironment]]:
     cfg: SandboxConfig = request.param
+    task_name = f"{__name__}_{cfg.id}"
+    await cfg.env_type.task_init(task_name=task_name, config=cfg.config)
+    envs = await cfg.env_type.sample_init(
+        task_name=task_name, config=cfg.config, metadata={}
+    )
+    try:
+        yield cfg, envs["default"]
+    finally:
+        await cfg.env_type.sample_cleanup(
+            task_name=task_name, config=cfg.config, environments=envs, interrupted=False
+        )
+        await cfg.env_type.task_cleanup(
+            task_name=task_name, config=cfg.config, cleanup=True
+        )
+
+
+@pytest.fixture
+def sandbox_env(
+    request, _config_and_env: tuple[SandboxConfig, SandboxEnvironment]
+) -> SandboxEnvironment:
+    cfg, env = _config_and_env
 
     # Known failures vary per sandbox, so apply them here rather than on the
     # (shared, provider-agnostic) check functions. originalname is the check's
@@ -128,22 +159,4 @@ async def sandbox_env(request) -> AsyncIterator[SandboxEnvironment]:
     if reason is not None:
         request.node.add_marker(pytest.mark.xfail(reason=reason, strict=True))
 
-    # task_init/sample_init and their cleanups run in this fixture's async
-    # context, which is the test's context too. The docker provider stashes
-    # running projects in a ContextVar during init and reads it back at cleanup;
-    # keeping both in one context avoids the LookupError that sank
-    # https://github.com/UKGovernmentBEIS/inspect_ai/pull/347 under pytest-asyncio.
-    task_name = f"{__name__}_{cfg.id}_{request.node.originalname}"
-    await cfg.env_type.task_init(task_name=task_name, config=cfg.config)
-    envs = await cfg.env_type.sample_init(
-        task_name=task_name, config=cfg.config, metadata={}
-    )
-    try:
-        yield envs["default"]
-    finally:
-        await cfg.env_type.sample_cleanup(
-            task_name=task_name, config=cfg.config, environments=envs, interrupted=False
-        )
-        await cfg.env_type.task_cleanup(
-            task_name=task_name, config=cfg.config, cleanup=True
-        )
+    return env
